@@ -1,0 +1,1102 @@
+Apache Airflow — Operators, Hooks, Scheduling & TaskFlow API
+Table of Contents
+Operators In Depth
+Hooks — Connecting to External Systems
+XComs — Task Communication
+Scheduling & DAG Configuration
+Template Variables (Jinja)
+TaskFlow API — The Modern Way
+Dynamic Task Mapping
+Task Groups
+1. Operators In Depth
+Operators are the building blocks of every DAG. Think of them like LEGO pieces — each one does a specific job, and you combine them to build your pipeline.
+
+Three categories:
+
+Action Operators — Execute something (run code, query a database, send an email)
+Transfer Operators — Move data from one system to another
+Sensor Operators — Wait for a condition to be true before proceeding
+1.1 PythonOperator
+The most flexible and commonly used operator. Runs any Python function as a task.
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+
+def extract_data():
+    """Extract data from source."""
+    print("Extracting data...")
+    data = {'sales': 1000, 'customers': 50}
+    return data  # Return value is automatically stored in XCom
+
+
+def transform_data(**context):
+    """Transform the extracted data."""
+    ti = context['ti']                         # Task Instance object
+    data = ti.xcom_pull(task_ids='extract')   # Get data from previous task
+
+    data['sales'] = data['sales'] * 1.1        # Apply 10% uplift
+    print(f"Transformed: {data}")
+    return data
+
+
+def load_data(**context):
+    """Load transformed data to destination."""
+    ti = context['ti']
+    data = ti.xcom_pull(task_ids='transform')
+    print(f"Loading: {data}")
+
+
+with DAG('python_operator_example',
+         start_date=datetime(2024, 1, 1),
+         schedule='@daily',
+         catchup=False) as dag:
+
+    extract   = PythonOperator(task_id='extract',   python_callable=extract_data)
+    transform = PythonOperator(task_id='transform', python_callable=transform_data)
+    load      = PythonOperator(task_id='load',      python_callable=load_data)
+
+    extract >> transform >> load
+Key PythonOperator parameters:
+
+PythonOperator(
+    task_id='my_task',
+    python_callable=my_function,          # The function to run
+    op_args=[arg1, arg2],                 # Positional arguments to pass
+    op_kwargs={'key': 'value'},           # Keyword arguments to pass
+    retries=3,                            # Retry up to 3 times on failure
+    retry_delay=timedelta(minutes=5),     # Wait 5 min between retries
+    execution_timeout=timedelta(hours=1), # Fail task if it runs over 1 hour
+)
+1.2 BashOperator
+Runs any shell command or bash script inside a task.
+
+from airflow.providers.standard.operators.bash import BashOperator
+from airflow import DAG
+from datetime import datetime
+
+with DAG(
+    dag_id='bash_example',
+    start_date=datetime(2024, 1, 1),
+    schedule='@daily',
+    catchup=False,
+    tags=['bash', 'example']
+) as dag:
+
+    create_dir = BashOperator(
+        task_id='create_directory',
+        bash_command='mkdir -p /tmp/airflow_data'
+    )
+
+    setup = BashOperator(
+        task_id='setup',
+        bash_command='''
+            echo "Starting setup..."
+            echo "Execution date is: {{ ds }}"
+            mkdir -p /tmp/airflow_data/{{ ds }}
+            echo "Folder created for date: {{ ds }}"
+        '''
+    )
+    create_file = BashOperator(
+        task_id='create_file',
+        bash_command='''
+            echo "sample data for {{ ds }}" > /tmp/airflow_data/{{ ds }}/data.txt
+            echo "File created successfully"
+        '''
+    )
+
+    create_dir >> setup >> create_file
+1.3 BranchPythonOperator
+Allows conditional logic in your pipeline. The function returns the task_id of whichever path should execute next.
+
+from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow import DAG
+from datetime import datetime
+import random
+
+
+def get_file_size():
+    """Simulate checking file size (in MB)"""
+    print("Checking file size...")
+    size = random.randint(10, 200)
+    print(f"File size is: {size} MB")
+    return size
+
+
+def decide_processing_path(**context):
+    """Return the task_id of the branch to take."""
+    file_size_mb = get_file_size()
+
+    if file_size_mb > 100:
+        print("Large file detected → Using Spark path")
+        return 'process_large_file'
+    else:
+        print("Small file detected → Using Pandas path")
+        return 'process_small_file'
+
+
+def process_large():
+    print("Processing large file using Spark...")
+
+
+def process_small():
+    print("Processing small file using Pandas...")
+
+
+def complete_pipeline():
+    print("Pipeline finished successfully!")
+
+
+with DAG(
+    dag_id='branching_example',
+    start_date=datetime(2024, 1, 1),
+    schedule='@daily',
+    catchup=False,
+    tags=['branching', 'example', 'etl']
+) as dag:
+
+    check = BranchPythonOperator(
+        task_id='check_file_size',
+        python_callable=decide_processing_path
+    )
+
+    large = PythonOperator(
+        task_id='process_large_file',
+        python_callable=process_large
+    )
+
+    small = PythonOperator(
+        task_id='process_small_file',
+        python_callable=process_small
+    )
+
+    complete = PythonOperator(
+        task_id='complete',
+        python_callable=complete_pipeline,
+        trigger_rule='none_failed'  # important for branching
+    )
+
+    # Dependency (branching structure)
+    check >> [large, small] >> complete
+Trigger Rules (used with branching):
+
+Rule	Behaviour
+all_success
+Default — all parents must succeed
+all_failed
+All parents must fail
+one_success
+At least one parent succeeded
+one_failed
+At least one parent failed
+none_failed
+No parents failed (success or skipped is OK)
+all_done
+All parents finished, regardless of state
+1.4 SnowflakeOperator
+Executes SQL against a Snowflake data warehouse.
+
+from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+
+with DAG('snowflake_example', start_date=datetime(2024, 1, 1)) as dag:
+
+    create_table = SnowflakeOperator(
+        task_id='create_table',
+        snowflake_conn_id='snowflake_default',  # References Connection in UI
+        sql='''
+            CREATE TABLE IF NOT EXISTS sales_summary (
+                date         DATE,
+                total_sales  DECIMAL(10,2),
+                order_count  INTEGER
+            )
+        '''
+    )
+
+    load_data = SnowflakeOperator(
+        task_id='load_data',
+        snowflake_conn_id='snowflake_default',
+        sql='''
+            INSERT INTO sales_summary
+            SELECT
+                '{{ ds }}'::DATE     AS date,
+                SUM(amount)          AS total_sales,
+                COUNT(*)             AS order_count
+            FROM raw_sales
+            WHERE date = '{{ ds }}'
+        '''
+    )
+
+    create_table >> load_data
+Setting up the Snowflake connection in the UI:
+
+Admin → Connections → Add Connection
+
+Connection Id:   snowflake_default
+Connection Type: Snowflake
+Account:         your-account
+Login:           your_username
+Password:        your_password
+Schema:          your_schema
+Database:        your_database
+Warehouse:       your_warehouse
+Role:            your_role
+1.5 PostgresOperator
+Executes SQL against a PostgreSQL database.
+
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+
+with DAG('postgres_example', start_date=datetime(2024, 1, 1)) as dag:
+
+    create_staging = PostgresOperator(
+        task_id='create_staging',
+        postgres_conn_id='postgres_default',
+        sql='''
+            CREATE TABLE IF NOT EXISTS staging_users (
+                user_id    INTEGER,
+                name       VARCHAR(100),
+                email      VARCHAR(100),
+                created_at TIMESTAMP
+            )
+        '''
+    )
+
+    truncate_staging = PostgresOperator(
+        task_id='truncate',
+        postgres_conn_id='postgres_default',
+        sql='TRUNCATE TABLE staging_users'
+    )
+
+    load_data = PostgresOperator(
+        task_id='load',
+        postgres_conn_id='postgres_default',
+        sql='''
+            INSERT INTO staging_users
+            SELECT * FROM source_users
+            WHERE updated_date = '{{ ds }}'
+        '''
+    )
+
+    create_staging >> truncate_staging >> load_data
+1.6 Sensor Operators
+Sensors wait for a condition to be true before the pipeline continues. They are essential for event-driven pipelines.
+
+FileSensor — wait for a local file:
+
+from airflow.sensors.filesystem import FileSensor
+
+wait_for_file = FileSensor(
+    task_id='wait_for_data_file',
+    filepath='/data/{{ ds }}_sales.csv',
+    poke_interval=60,    # Check every 60 seconds
+    timeout=3600,        # Give up after 1 hour
+    mode='reschedule'    # Release worker slot between checks
+)
+S3KeySensor — wait for a file in AWS S3:
+
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+
+wait_for_s3 = S3KeySensor(
+    task_id='wait_for_s3_file',
+    bucket_name='my-data-bucket',
+    bucket_key='data/{{ ds }}/sales.csv',
+    aws_conn_id='aws_default',
+    poke_interval=300,   # Check every 5 minutes
+    timeout=7200,        # Give up after 2 hours
+    mode='reschedule'
+)
+Sensor modes explained:
+
+Mode	Behaviour	When to Use
+poke
+Holds the worker slot while checking	Short waits (< 5 min)
+reschedule
+Releases the worker between checks	Long waits (hours) — always prefer this
+⚠️ Always use
+mode='reschedule'
+for sensors that wait more than a few minutes.
+poke
+mode ties up a worker slot the entire time, which can exhaust your worker pool.
+
+2. Hooks — Connecting to External Systems
+Hooks are the low-level connection layer in Airflow. Operators use hooks internally, but you can also use hooks directly inside PythonOperator tasks for maximum flexibility.
+
+Operator (What to do) ──uses──→ Hook (How to connect)
+
+PostgresOperator  ──→  PostgresHook
+SnowflakeOperator ──→  SnowflakeHook
+S3Operator        ──→  S3Hook
+HttpOperator      ──→  HttpHook
+Why use hooks instead of direct connections?
+
+# BAD — Hardcoded credentials (never do this)
+def bad_connect():
+    import psycopg2
+    conn = psycopg2.connect(
+        host='prod-db.example.com',
+        user='admin',
+        password='MyS3cretP@ss',   # Security risk!
+        database='analytics'
+    )
+
+# GOOD — Credentials stored securely in Airflow Connections
+def good_connect():
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+    hook = PostgresHook(postgres_conn_id='postgres_default')
+    records = hook.get_records('SELECT * FROM users')
+2.1 PostgresHook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+import pandas as pd
+
+
+def use_postgres(**context):
+    hook = PostgresHook(postgres_conn_id='postgres_default')
+
+    # Fetch rows as a list of tuples
+    records = hook.get_records('SELECT id, name FROM users LIMIT 10')
+    print(f"Found {len(records)} records")
+
+    # Fetch a single row
+    row = hook.get_first('SELECT COUNT(*) FROM orders')
+    print(f"Order count: {row[0]}")
+
+    # Fetch as a pandas DataFrame (great for transformations)
+    df = hook.get_pandas_df(f"SELECT * FROM sales WHERE date = '{context['ds']}'")
+    print(df.head())
+
+    # Execute INSERT / UPDATE / DELETE
+    hook.run('''
+        INSERT INTO audit_log (message, created_at)
+        VALUES ('Pipeline started', NOW())
+    ''')
+
+    # Bulk insert rows
+    rows = [('Alice', 25), ('Bob', 30), ('Charlie', 35)]
+    hook.insert_rows(
+        table='users',
+        rows=rows,
+        target_fields=['name', 'age']
+    )
+2.2 SnowflakeHook
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+import pandas as pd
+
+
+def use_snowflake(**context):
+    hook = SnowflakeHook(snowflake_conn_id='snowflake_default')
+
+    # Execute DDL or DML
+    hook.run('''
+        CREATE TABLE IF NOT EXISTS daily_sales (
+            date       DATE,
+            product_id INTEGER,
+            amount     DECIMAL(10,2)
+        )
+    ''')
+
+    # Get data as a pandas DataFrame
+    df = hook.get_pandas_df(f'''
+        SELECT product_id, SUM(amount) as total
+        FROM daily_sales
+        WHERE date = '{context["ds"]}'
+        GROUP BY product_id
+    ''')
+
+    print(f"Total daily revenue: ${df['total'].sum():,.2f}")
+    return df.to_json()
+2.3 S3Hook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+import pandas as pd
+
+
+def use_s3(**context):
+    hook = S3Hook(aws_conn_id='aws_default')
+
+    # Upload a local file to S3
+    hook.load_file(
+        filename='/tmp/output.csv',
+        key=f"data/{context['ds']}/output.csv",
+        bucket_name='my-data-bucket',
+        replace=True
+    )
+
+    # Upload a string directly to S3
+    hook.load_string(
+        string_data='col1,col2\n1,2\n3,4',
+        key=f"data/{context['ds']}/small.csv",
+        bucket_name='my-data-bucket'
+    )
+
+    # Download a file from S3
+    obj = hook.get_key('data/input.csv', bucket_name='my-data-bucket')
+    df = pd.read_csv(obj.get()['Body'])
+
+    # Check if a file exists
+    exists = hook.check_for_key(
+        key=f"data/{context['ds']}/file.csv",
+        bucket_name='my-data-bucket'
+    )
+    print(f"File exists: {exists}")
+2.4 HttpHook
+from airflow.providers.http.hooks.http import HttpHook
+
+
+def call_rest_api():
+    # GET request
+    get_hook = HttpHook(method='GET', http_conn_id='api_default')
+    response = get_hook.run(
+        endpoint='/users/123',
+        headers={'Authorization': 'Bearer your_token'}
+    )
+    user = response.json()
+    print(f"User name: {user['name']}")
+
+    # POST request
+    post_hook = HttpHook(method='POST', http_conn_id='api_default')
+    response = post_hook.run(
+        endpoint='/users',
+        json={'name': 'John', 'email': 'john@example.com'},
+        headers={'Content-Type': 'application/json'}
+    )
+    print(f"Created user ID: {response.json()['id']}")
+3. XComs — Task Communication
+XCom (Cross-Communication) is the mechanism that allows tasks to pass data to each other. Values are stored in the metadata database and retrieved by downstream tasks.
+
+3.1 How XComs Work
+Task A runs → returns a value
+     │
+     └→ Value is stored in the metadata DB as an XCom
+                 │
+                 └→ Task B calls xcom_pull() → retrieves the value
+3.2 Basic XCom Usage
+def produce_data():
+    """Any return value is automatically pushed to XCom."""
+    result = {
+        'total_sales': 50000,
+        'order_count': 150
+    }
+    return result  # Stored in XCom automatically
+
+
+def consume_data(**context):
+    """Pull data from an upstream task."""
+    ti = context['ti']  # Task Instance
+    data = ti.xcom_pull(task_ids='produce_data')
+
+    print(f"Sales: ${data['total_sales']:,}")
+    print(f"Orders: {data['order_count']}")
+
+    # You can also return a new value for the next task
+    return data['total_sales'] * 1.1  # 10% growth projection
+
+
+def use_projection(**context):
+    ti = context['ti']
+    projected = ti.xcom_pull(task_ids='consume_data')
+    print(f"Projected sales: ${projected:,.2f}")
+3.3 Advanced XCom Patterns
+def explicit_push_pull(**context):
+    ti = context['ti']
+
+    # Push multiple named values from one task
+    ti.xcom_push(key='sales_total', value=50000)
+    ti.xcom_push(key='region',      value='US-West')
+
+    # Pull named values in another task
+    sales  = ti.xcom_pull(task_ids='upstream_task', key='sales_total')
+    region = ti.xcom_pull(task_ids='upstream_task', key='region')
+
+
+def aggregate_from_multiple(**context):
+    ti = context['ti']
+
+    # Pull results from several parallel upstream tasks at once
+    results = ti.xcom_pull(task_ids=['extract_orders', 'extract_customers', 'extract_products'])
+    # Returns a list: [result_from_orders, result_from_customers, result_from_products]
+
+    print(f"Got {len(results)} datasets")
+3.4 XCom Best Practices
+DO — store small data or file paths:
+
+# Small dictionary — fine
+return {'total': 1000, 'region': 'US', 'status': 'complete'}
+
+# File path — excellent practice for large data
+return 's3://my-bucket/processed/2024-01-15/data.parquet'
+DON'T — store large data objects:
+
+# BAD: 500 MB DataFrame stored in the metadata database!
+df = pd.read_csv('huge_file.csv')
+return df.to_json()
+
+# GOOD: Save large data to S3, store only the path in XCom
+df = pd.read_csv('huge_file.csv')
+df.to_parquet('s3://my-bucket/temp/data.parquet')
+return {
+    'path': 's3://my-bucket/temp/data.parquet',
+    'records': len(df),
+    'columns': list(df.columns)
+}
+XCom data is stored in the metadata database. Storing large objects there will degrade database performance for the entire Airflow installation.
+
+4. Scheduling & DAG Configuration
+4.1 The Execution Date Concept
+This is one of the most important — and initially confusing — concepts in Airflow.
+
+The execution_date represents the START of the data interval, not the time the DAG actually runs.
+
+Schedule: @daily (runs at midnight)
+start_date: January 1, 2024
+
+─────────────────────────────────────────────────────────────
+Jan 2 00:00 → DAG Run fires  │ execution_date = Jan 1, 2024
+Jan 3 00:00 → DAG Run fires  │ execution_date = Jan 2, 2024
+Jan 4 00:00 → DAG Run fires  │ execution_date = Jan 3, 2024
+─────────────────────────────────────────────────────────────
+
+Why? Because when it is Jan 2, you are processing Jan 1's complete data.
+The pipeline always runs AFTER the interval it covers is finished.
+In Airflow 2.2+ this is expressed as data_interval_start and data_interval_end.
+
+4.2 Schedule Interval Options
+Cron Expressions:
+
+┌─── Minute    (0 - 59)
+│  ┌── Hour     (0 - 23)
+│  │  ┌─ Day of Month (1 - 31)
+│  │  │  ┌ Month (1 - 12)
+│  │  │  │  ┌ Day of Week (0 - 6, Sunday = 0)
+│  │  │  │  │
+*  *  *  *  *
+'0 2 * * *'       # Every day at 2:00 AM
+'0 */4 * * *'     # Every 4 hours (midnight, 4am, 8am...)
+'*/15 * * * *'    # Every 15 minutes
+'0 9 * * 1-5'     # Weekdays at 9:00 AM
+'0 0 1 * *'       # First day of every month at midnight
+'30 5 * * 1,4'    # Monday and Thursday at 5:30 AM
+Use crontab.guru to build and test cron expressions.
+
+Preset shortcuts:
+
+'@once'      # Run exactly one time
+'@hourly'    # Every hour at minute 0     → 0 * * * *
+'@daily'     # Every day at midnight      → 0 0 * * *
+'@weekly'    # Every Sunday at midnight   → 0 0 * * 0
+'@monthly'   # First of month at midnight → 0 0 1 * *
+'@yearly'    # January 1st at midnight    → 0 0 1 1 *
+Timedelta intervals (fixed duration):
+
+from datetime import timedelta
+
+schedule=timedelta(hours=6)     # Exactly every 6 hours
+schedule=timedelta(minutes=30)  # Every 30 minutes
+schedule=timedelta(days=2)      # Every 2 days
+Manual only:
+
+schedule=None  # DAG only runs when manually triggered
+4.3 Critical DAG Parameters
+start_date — when the DAG becomes active:
+
+# CORRECT: Fixed date
+dag = DAG('my_dag', start_date=datetime(2024, 1, 1), ...)
+
+# CORRECT: Relative to today
+from airflow.utils.dates import days_ago
+dag = DAG('my_dag', start_date=days_ago(1), ...)
+
+# WRONG: Dynamic date — changes every time the Scheduler parses the file!
+dag = DAG('my_dag', start_date=datetime.now(), ...)  # Never do this
+catchup — backfill control:
+
+# Scenario: DAG's start_date is Jan 1 but you deploy it on Jan 10
+
+# catchup=True (default behaviour)
+# Airflow creates 10 DAG runs immediately to "catch up":
+# Jan 1, Jan 2, Jan 3, ... Jan 10 — all fire at once
+dag = DAG('my_dag', start_date=datetime(2024, 1, 1), catchup=True)
+
+# catchup=False (recommended for most pipelines)
+# Airflow only creates runs from today forward
+dag = DAG('my_dag', start_date=datetime(2024, 1, 1), catchup=False)
+When to use each:
+
+catchup=True
+— Historical data reprocessing, initial data loads
+catchup=False
+— Live operational pipelines, API integrations
+default_args — task defaults:
+
+from datetime import timedelta
+
+default_args = {
+    'owner': 'data-engineering',
+    'depends_on_past': False,
+    'email': ['alerts@company.com'],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+    'execution_timeout': timedelta(minutes=30),
+}
+
+dag = DAG(
+    'my_dag',
+    start_date=datetime(2024, 1, 1),
+    schedule='@daily',
+    default_args=default_args    # Applied to every task in this DAG
+)
+Other important DAG parameters:
+
+dag = DAG(
+    'my_dag',
+    start_date=datetime(2024, 1, 1),
+    schedule='@hourly',
+    catchup=False,
+    max_active_runs=3,              # Max concurrent DAG runs (useful with catchup)
+    dagrun_timeout=timedelta(hours=2),  # Fail entire DAG if it exceeds 2 hours
+    tags=['production', 'finance'],
+    doc_md="""
+    # My DAG
+    Describe what this pipeline does, its data sources, outputs, and schedule.
+    """
+)
+4.4 Task-Level Parameters
+Retries and backoff:
+
+task = PythonOperator(
+    task_id='flaky_api_call',
+    python_callable=call_api,
+    retries=5,
+    retry_delay=timedelta(minutes=10),
+    retry_exponential_backoff=True,  # Double the delay each retry
+    max_retry_delay=timedelta(hours=1)
+)
+
+# Retry timeline with exponential backoff:
+# Attempt 1 fails → wait 10 min
+# Attempt 2 fails → wait 20 min
+# Attempt 3 fails → wait 40 min
+# Attempt 4 fails → wait 60 min (capped)
+# Attempt 5 fails → wait 60 min (capped)
+depends_on_past:
+
+task = PythonOperator(
+    task_id='incremental_load',
+    python_callable=load_incrementally,
+    depends_on_past=True  # Only runs if the previous day's run succeeded
+)
+# Use for incremental pipelines where each run builds on the previous one
+Resource pools:
+
+# First create pools in UI: Admin → Pools
+# Example: 'database_pool' with 5 slots limits concurrent DB queries
+
+task = PythonOperator(
+    task_id='heavy_query',
+    python_callable=run_query,
+    pool='database_pool',  # This task competes for slots in the pool
+    pool_slots=1,          # Uses 1 of the 5 available slots
+    priority_weight=10     # Higher number = higher priority in the queue
+)
+SLA (Service Level Agreement):
+
+task = PythonOperator(
+    task_id='time_sensitive_task',
+    python_callable=process_orders,
+    sla=timedelta(hours=2)  # Alert if this task takes more than 2 hours
+)
+5. Template Variables (Jinja)
+Airflow supports Jinja templating inside operator parameters. This lets you inject runtime values like dates into SQL queries, file paths, and bash commands.
+
+from airflow.operators.bash import BashOperator
+
+templated_task = BashOperator(
+    task_id='use_templates',
+    bash_command='''
+        echo "DAG name: {{ dag.dag_id }}"
+        echo "Task name: {{ task.task_id }}"
+        echo "Run date: {{ ds }}"
+        echo "Run date no dashes: {{ ds_nodash }}"
+        echo "Yesterday: {{ yesterday_ds }}"
+        echo "Tomorrow: {{ tomorrow_ds }}"
+
+        mkdir -p /data/{{ ds }}
+        curl https://api.example.com/data/{{ ds_nodash }}.json -o /data/{{ ds }}/raw.json
+    '''
+)
+All available template variables:
+
+Variable	Example Value	Description
+{{ ds }}
+2024-01-15
+Execution date as
+YYYY-MM-DD
+{{ ds_nodash }}
+20240115
+Execution date without dashes
+{{ yesterday_ds }}
+2024-01-14
+Yesterday's date
+{{ tomorrow_ds }}
+2024-01-16
+Tomorrow's date
+{{ ts }}
+2024-01-15T00:00:00+00:00
+Full ISO 8601 timestamp
+{{ dag.dag_id }}
+my_pipeline
+The DAG's ID string
+{{ task.task_id }}
+extract_data
+The task's ID string
+{{ run_id }}
+scheduled__2024-01-15T00:00:00
+Unique run identifier
+{{ execution_date }}
+DateTime object	Full Python datetime
+{{ data_interval_start }}
+DateTime object	Start of data interval (Airflow 2.2+)
+{{ data_interval_end }}
+DateTime object	End of data interval (Airflow 2.2+)
+6. TaskFlow API — The Modern Way
+The TaskFlow API (introduced in Airflow 2.0) is the modern, recommended way to write DAGs. It uses Python decorators to eliminate boilerplate — no more manual XCom push/pull, no more provide_context=True.
+
+6.1 Traditional vs. TaskFlow Comparison
+Traditional style (verbose):
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+
+def extract():
+    return {'value': 100}
+
+def transform(**context):
+    ti   = context['ti']
+    data = ti.xcom_pull(task_ids='extract')
+    data['value'] *= 2
+    return data
+
+def load(**context):
+    ti   = context['ti']
+    data = ti.xcom_pull(task_ids='transform')
+    print(f"Loading: {data}")
+
+
+with DAG('traditional_style', start_date=datetime(2024, 1, 1)) as dag:
+    t1 = PythonOperator(task_id='extract',   python_callable=extract)
+    t2 = PythonOperator(task_id='transform', python_callable=transform)
+    t3 = PythonOperator(task_id='load',      python_callable=load)
+    t1 >> t2 >> t3
+TaskFlow style (clean):
+
+from airflow.decorators import dag, task
+from datetime import datetime
+
+
+@dag(start_date=datetime(2024, 1, 1), schedule='@daily', catchup=False)
+def taskflow_example():
+
+    @task
+    def extract() -> dict:
+        return {'value': 100}
+
+    @task
+    def transform(data: dict) -> dict:
+        data['value'] *= 2       # Receives data directly — no xcom_pull needed
+        return data
+
+    @task
+    def load(data: dict) -> None:
+        print(f"Loading: {data}")
+
+    # Dependencies are inferred from function calls
+    raw       = extract()
+    processed = transform(raw)
+    load(processed)
+
+
+dag_instance = taskflow_example()
+Key benefits of TaskFlow:
+
+XComs are handled automatically (no xcom_push / xcom_pull)
+Task IDs are derived from function names automatically
+Dependencies are expressed as function calls — much more readable
+Full Python type hints support
+Better IDE auto-complete and error detection
+6.2 TaskFlow Patterns
+Pattern 1: Simple ETL
+
+from airflow.decorators import dag, task
+from datetime import datetime
+import pandas as pd
+
+
+@dag(start_date=datetime(2024, 1, 1), schedule='@daily', catchup=False)
+def sales_etl():
+
+    @task
+    def extract(ds=None) -> dict:
+        """Extract sales data for the given date."""
+        return {
+            'date': ds,
+            'sales': [100, 200, 150, 300, 250]
+        }
+
+    @task
+    def transform(raw: dict) -> str:
+        """Calculate tax and totals."""
+        df = pd.DataFrame({'sales': raw['sales']})
+        df['tax']   = df['sales'] * 0.1
+        df['total'] = df['sales'] + df['tax']
+        print(f"Total revenue: ${df['total'].sum():.2f}")
+        return df.to_json()
+
+    @task
+    def load(data_json: str) -> None:
+        """Write to output."""
+        df = pd.read_json(data_json)
+        print(f"Loaded {len(df)} rows. Grand total: ${df['total'].sum():.2f}")
+
+    raw       = extract()
+    processed = transform(raw)
+    load(processed)
+
+
+dag_instance = sales_etl()
+Pattern 2: Multiple Outputs from One Task
+
+from typing import Dict
+
+
+@dag(start_date=datetime(2024, 1, 1))
+def multiple_outputs_example():
+
+    @task(multiple_outputs=True)   # Return dict keys become individual XComs
+    def compute_metrics() -> Dict[str, float]:
+        return {
+            'total_sales':  10000.0,
+            'order_count':  150,
+            'avg_order':    66.67
+        }
+
+    @task
+    def generate_report(total_sales: float, order_count: int) -> None:
+        print(f"Revenue: ${total_sales:,.2f} across {order_count} orders")
+
+    @task
+    def check_threshold(avg_order: float) -> None:
+        if avg_order < 50:
+            print("WARNING: Average order value is below target")
+
+    metrics = compute_metrics()
+
+    # Each key from the dict is passed individually
+    generate_report(metrics['total_sales'], metrics['order_count'])
+    check_threshold(metrics['avg_order'])
+
+
+dag_instance = multiple_outputs_example()
+Pattern 3: Branching with TaskFlow
+
+from airflow import DAG
+from airflow.decorators import task, dag
+from datetime import datetime
+
+@dag(start_date=datetime(2024, 1, 1))
+def branching_taskflow():
+
+    @task
+    def get_file_size() -> int:
+        import random
+        return random.randint(1, 200)
+
+    @task.branch
+    def choose_path(size: int) -> str:
+        """Return the task_id of the branch to execute."""
+        return 'heavy_processing' if size > 100 else 'light_processing'
+
+    @task
+    def heavy_processing() -> None:
+        print("Processing with Spark for large file")
+
+    @task
+    def light_processing() -> None:
+        print("Processing with Pandas for small file")
+
+    @task(trigger_rule='none_failed')
+    def finalize() -> None:
+        print("Pipeline complete!")
+
+    size   = get_file_size()
+    branch = choose_path(size)
+    heavy  = heavy_processing()
+    light  = light_processing()
+    final  = finalize()
+
+    branch >> [heavy, light] >> final
+
+
+dag_instance = branching_taskflow()
+Pattern 4: Accessing Airflow Context
+
+@dag(start_date=datetime(2024, 1, 1))
+def context_access_example():
+
+    @task
+    def process(ds=None, ti=None, **context) -> str:
+        """Airflow injects context variables by name."""
+        print(f"Execution date: {ds}")
+        print(f"Task ID: {ti.task_id}")
+        print(f"DAG: {context['dag'].dag_id}")
+        return f"Processed {ds}"
+
+    @task
+    def report(result: str, ds=None, **context) -> None:
+        print(f"Result: {result}")
+        print(f"Reported for date: {ds}")
+
+    output = process()
+    report(output)
+
+
+dag_instance = context_access_example()
+7. Dynamic Task Mapping
+Dynamic Task Mapping (Airflow 2.3+) allows you to create a variable number of parallel task instances at runtime — without knowing the number of tasks at DAG write time.
+
+7.1 Basic Dynamic Mapping
+from airflow.decorators import dag, task
+from datetime import datetime
+
+
+@dag(start_date=datetime(2024, 1, 1), schedule='@daily')
+def dynamic_file_processing():
+
+    @task
+    def get_files_to_process() -> list:
+        """Return the list of files — could come from an S3 listing, DB query, etc."""
+        return [
+            'sales_region_north.csv',
+            'sales_region_south.csv',
+            'sales_region_east.csv',
+            'sales_region_west.csv',
+        ]
+
+    @task
+    def process_file(filename: str) -> dict:
+        """This runs once for EACH file in the list — in parallel."""
+        import random
+        print(f"Processing: {filename}")
+        return {'filename': filename, 'records': random.randint(100, 1000)}
+
+    @task
+    def summarise(results: list) -> None:
+        """Receives all results as a list once all parallel tasks complete."""
+        total = sum(r['records'] for r in results)
+        print(f"Processed {len(results)} files, total records: {total:,}")
+
+    files   = get_files_to_process()
+    results = process_file.expand(filename=files)  # Creates one task per file
+    summarise(results)
+
+
+dag_instance = dynamic_file_processing()
+7.2 Mapping with Static and Dynamic Inputs
+@dag(start_date=datetime(2024, 1, 1))
+def mapped_with_static_input():
+
+    @task
+    def get_regions() -> list:
+        return ['north', 'south', 'east', 'west']
+
+    @task
+    def process_region(region: str, multiplier: float) -> float:
+        base_value = 1000.0
+        return base_value * multiplier
+
+    regions = get_regions()
+
+    # partial() sets static arguments, expand() maps the dynamic ones
+    results = process_region.partial(multiplier=1.15).expand(region=regions)
+
+
+dag_instance = mapped_with_static_input()
+8. Task Groups
+Task Groups let you visually group related tasks in the Airflow UI. This is purely a UI/organisational feature — it does not change execution behaviour.
+
+from airflow.decorators import dag, task, task_group
+from datetime import datetime
+
+
+@dag(start_date=datetime(2024, 1, 1), schedule='@daily', catchup=False)
+def grouped_pipeline():
+
+    @task
+    def validate_prerequisites() -> dict:
+        print("Checking source availability...")
+        return {'date': '2024-01-15', 'files_found': 3}
+
+    @task_group(group_id='extract_and_transform')
+    def extract_transform(config: dict) -> str:
+        """These tasks appear as a collapsible group in the UI."""
+
+        @task
+        def extract(cfg: dict) -> str:
+            print(f"Extracting for date: {cfg['date']}")
+            return '{"records": 500}'
+
+        @task
+        def clean(raw_json: str) -> str:
+            print("Cleaning and validating data...")
+            return raw_json  # Simplified
+
+        @task
+        def transform(clean_json: str) -> str:
+            print("Applying business transformations...")
+            return clean_json
+
+        raw     = extract(config)
+        cleaned = clean(raw)
+        return transform(cleaned)
+
+    @task
+    def load(data: str) -> dict:
+        print(f"Loading to warehouse: {data}")
+        return {'records_loaded': 500}
+
+    @task
+    def notify(result: dict) -> None:
+        print(f"Pipeline complete. Loaded {result['records_loaded']} records.")
+
+    config      = validate_prerequisites()
+    transformed = extract_transform(config)
+    loaded      = load(transformed)
+    notify(loaded)
+
+
+dag_instance = grouped_pipeline()
+Why use Task Groups?
+
+Large DAGs with 50+ tasks become visually unmanageable
+Groups let you collapse sections in the Graph View
+Makes it easier to understand pipeline structure at a glance
+You can trigger or clear an entire group at once from the UI
+Video
+
+Video 1 of 7
+Interview Questions
+Q1
+What is the difference between an Operator and a Hook?
+Q2
+What is the difference between Sensor poke mode and reschedule mode?
+Q3
+What is an XCom and what is the biggest mistake people make with it?
+Q4
+What is the main advantage of TaskFlow API over traditional PythonOperator?
+Q5
+What is Dynamic Task Mapping and when would you use it?
+Q6
+What is a Resource Pool and why would you create one?
+Q7
+What does depends_on_past=True do on a task?
